@@ -7,8 +7,6 @@ from time import sleep
 import typing as t
 
 import click
-from queue import Queue
-import threading
 import math
 import numpy as np
 from pydantic import BaseModel
@@ -172,25 +170,17 @@ def main(
             sleep(0.5)
 
     ndi_provider = NDI()
-    frame_buffer: Queue[np.ndarray] = Queue(8)
-
-    ndi_thread = threading.Thread(target=ndi_provider.queue_frames,
-                                  args=(frame_buffer,),
-                                  daemon=True)
-    ndi_thread.start()
 
     x_old = -1
     y_old = -1
     mask = np.zeros(0,dtype=bool)
     while True:
-        log.debug(f"Queue-Size: {frame_buffer.qsize()}")
         start = time.perf_counter()
 
-        # frame = ndi_provider.recv_frame()
-        # if frame is None:
-        #     continue
-        frame = frame_buffer.get()
-        buffer_time = time.perf_counter()
+        frame = ndi_provider.recv_frame()
+        if frame is None:
+            continue
+        recv_time = time.perf_counter()
 
         per = 0.20
         # Yes. y than x
@@ -206,8 +196,8 @@ def main(
 
         osc.send_rgb(avg_rgb[0],avg_rgb[1],avg_rgb[2])
         end_send_time = time.perf_counter()
-        log.debug(f"[Timings] Buffer={buffer_time-start:.2f};"
-                  f"Compute={end_compute_time-buffer_time:.2f};"
+        log.debug(f"[Timings] Recv={recv_time-start:.2f};"
+                  f"Compute={end_compute_time-recv_time:.2f};"
                   f"Send={end_send_time-end_compute_time:.3f}")
 
 if __name__ == "__main__":
