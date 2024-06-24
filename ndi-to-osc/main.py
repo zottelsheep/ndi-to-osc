@@ -1,6 +1,8 @@
 from __future__ import annotations
 import time
 import logging
+from multiprocessing import Queue
+import multiprocessing as mp
 from pathlib import Path
 import sys
 from time import sleep
@@ -61,6 +63,7 @@ class OSC:
         self.send("R", int(r))
         self.send("G", int(g))
         self.send("B", int(b))
+
 
 class NDI:
 
@@ -136,6 +139,29 @@ class NDI:
                 continue
             queue.put(frame)
 
+
+def background_frame_to_osc(config: Config, frame_queue: Queue[np.ndarray]):
+    osc = OSC.from_config(config)
+
+    x_old = -1
+    y_old = -1
+    mask = np.zeros(0, dtype=bool)
+    while True:
+        frame = frame_queue.get()
+
+        per = 0.20
+        # Yes. y than x
+        y, x, _ = frame.shape
+        if (x_old, y_old) != (x, y):
+            y_b = math.floor(y * per)
+            x_b = math.floor(x * per)
+            mask = np.ones((y, x), dtype=bool)
+            mask[y_b:y - y_b + 1, x_b:x - x_b + 1] = False
+
+        avg_rgb = np.average(frame[mask], axis=0).round()
+        osc.send_rgb(avg_rgb[0], avg_rgb[1], avg_rgb[2])
+
+
 @click.command()
 @click.option(
     "-c",
@@ -162,43 +188,30 @@ def main(
     with open(config_path) as f:
         config = Config.model_validate(YAML().load(f))
 
-    osc = OSC.from_config(config)
-
     if send_paths:
+        osc = OSC.from_config(config)
         while True:
             osc.send_paths()
             sleep(0.5)
 
+    # Init ndi
     ndi_provider = NDI()
 
-    x_old = -1
-    y_old = -1
-    mask = np.zeros(0,dtype=bool)
-    while True:
-        start = time.perf_counter()
+    frame_queue = Queue(8)
 
+    # Start background osc worker process
+    frame_process = mp.Process(target=background_frame_to_osc,
+                               args=(config, frame_queue),
+                               daemon=True)
+    frame_process.start()
+
+    while True:
         frame = ndi_provider.recv_frame()
         if frame is None:
             continue
-        recv_time = time.perf_counter()
+        log.debug(f"QUEUE-SIZE: {frame_queue.qsize()}")
+        frame_queue.put(frame)
 
-        per = 0.20
-        # Yes. y than x
-        y,x,_ = frame.shape
-        if (x_old,y_old) != (x,y):
-            y_b = math.floor(y*per)
-            x_b = math.floor(x*per)
-            mask = np.ones((y,x),dtype=bool)
-            mask[y_b:y-y_b+1,x_b:x-x_b+1] = False
-
-        avg_rgb = np.average(frame[mask], axis=0).round()
-        end_compute_time = time.perf_counter()
-
-        osc.send_rgb(avg_rgb[0],avg_rgb[1],avg_rgb[2])
-        end_send_time = time.perf_counter()
-        log.debug(f"[Timings] Recv={recv_time-start:.2f};"
-                  f"Compute={end_compute_time-recv_time:.2f};"
-                  f"Send={end_send_time-end_compute_time:.3f}")
 
 if __name__ == "__main__":
     main()
