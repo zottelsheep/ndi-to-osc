@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ndi-to-osc"
+description = 'A tool to get the average color of an ndi-video-stream and send it as RGB osc-color signals'
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = []
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = [
+  "ndi-python",
+  "python-osc",
+  "click",
+  "rich",
+  "questionary",
+  "ruamel.yaml",
+]
+dynamic = ["version"]
+
+
+[tool.hatch.version]
+path = "ndi-to-osc/__about__.py"
