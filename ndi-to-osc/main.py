@@ -119,14 +119,20 @@ class NDI:
         ndi.destroy()
         log.info('[NDI] Deinitalizing complete!')
 
-    def recv_frame(self, rate: int = 250):
-        t, v, _, _ = ndi.recv_capture_v2(self.ndi_recv, rate)
+    def recv_frame(self, rate: int = 250) -> np.ndarray | None:
+        t, v, a, m = ndi.recv_capture_v2(self.ndi_recv, rate)
 
         if t == ndi.FRAME_TYPE_VIDEO:
             log.debug(f'[NDI] Video data received ({v.xres},{v.yres})')
             frame = np.copy(v.data)
             ndi.recv_free_video_v2(self.ndi_recv, v)
             return frame
+        elif t == ndi.FRAME_TYPE_AUDIO:
+            ndi.recv_free_audio_v3(self.ndi_recv, a)
+        elif t == ndi.FRAME_TYPE_METADATA:
+            metadata = m.data
+            log.info(f'[NDI] Metadata received: {metadata} ')
+            ndi.recv_free_metadata(self.ndi_recv, m)
         elif t == ndi.FRAME_TYPE_NONE:
             log.debug('[NDI] No new data received')
         else:
