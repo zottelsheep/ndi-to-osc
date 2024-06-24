@@ -1,5 +1,5 @@
 from __future__ import annotations
-import time
+from collections import defaultdict, deque
 import logging
 from multiprocessing import Queue
 import multiprocessing as mp
@@ -10,11 +10,14 @@ import typing as t
 
 import click
 import math
+from matplotlib import pyplot as plt
 import numpy as np
 from pydantic import BaseModel
 from pythonosc.udp_client import SimpleUDPClient
 import questionary
 from ruamel.yaml import YAML
+
+from ndi_to_osc.segments import Segment
 
 if t.TYPE_CHECKING:
     ndi: t.Any = None
@@ -35,34 +38,43 @@ class Config(BaseModel):
     osc_server_ip: str
     osc_server_port: int
 
+    blackout_threshold: int = 0
+
+    segments: list[Segment]
+
 
 class OSC:
     """
     Manage OSC protocol / connection
     """
 
-    def __init__(self, osc_server_ip: str, osc_server_port: int):
+    def __init__(self, osc_server_ip: str, osc_server_port: int, blackout_threshold: int):
         self.client: SimpleUDPClient = SimpleUDPClient(osc_server_ip,
                                                        osc_server_port)
+        self.blackout_threshold = blackout_threshold
 
     @classmethod
     def from_config(cls, config: Config) -> OSC:
-        return cls(config.osc_server_ip, config.osc_server_port)
+        return cls(config.osc_server_ip, config.osc_server_port, config.blackout_threshold)
 
     def send(self, addr: str, value: float | int = 1):
         """Send message to OSC bus"""
-        self.client.send_message(addr, value)  # Send float message
+        if value > self.blackout_threshold:
+            self.client.send_message(addr, value)  # Send float message
 
     def send_paths(self):
         for path in "RGB":
             self.send(path, 1)
             sleep(0.05)
 
-    def send_rgb(self, r: float, g: float, b: float):
-        log.info(f"[OSC] Send RGB values: R={r:.2f}, G={g:.2f}, B={b:.2f}")
-        self.send("R", int(r))
-        self.send("G", int(g))
-        self.send("B", int(b))
+    def send_rgb(self, r: float, g: float, b: float,
+                 segment: str):
+        if segment:
+            log.debug(f"[OSC] Send RGB values for segment '{segment}': R={r:.2f}, G={g:.2f}, B={b:.2f}")
+
+        self.send(f"segment_{segment}_R", int(r))
+        self.send(f"segment_{segment}_G", int(g))
+        self.send(f"segment_{segment}_B", int(b))
 
 
 class NDI:
@@ -85,13 +97,13 @@ class NDI:
             if not sources:
                 continue
 
-            ndi_source = questionary.select("Please select an ndi device",
-                                            choices=[
-                                                questionary.Choice(
-                                                    f"{ndi_source.ndi_name} [{ndi_source.url_address}]",
-                                                    ndi_source)
-                                                for ndi_source in sources
-                                            ]).ask()
+            ndi_source = questionary.select(
+                "Please select an ndi device",
+                choices=[
+                    questionary.Choice(
+                        f"{ndi_source.ndi_name} [{ndi_source.url_address}]",
+                        ndi_source) for ndi_source in sources
+                ]).ask()
             if not ndi_source:
                 log.info('[NDI] No source choosen..')
                 continue
@@ -122,21 +134,25 @@ class NDI:
     def recv_frame(self, rate: int = 250) -> np.ndarray | None:
         t, v, a, m = ndi.recv_capture_v2(self.ndi_recv, rate)
 
-        if t == ndi.FRAME_TYPE_VIDEO:
-            log.debug(f'[NDI] Video data received ({v.xres},{v.yres})')
-            frame = np.copy(v.data)
-            ndi.recv_free_video_v2(self.ndi_recv, v)
-            return frame
-        elif t == ndi.FRAME_TYPE_AUDIO:
-            ndi.recv_free_audio_v3(self.ndi_recv, a)
-        elif t == ndi.FRAME_TYPE_METADATA:
-            metadata = m.data
-            log.info(f'[NDI] Metadata received: {metadata} ')
-            ndi.recv_free_metadata(self.ndi_recv, m)
-        elif t == ndi.FRAME_TYPE_NONE:
-            log.debug('[NDI] No new data received')
-        else:
-            log.debug('[NDI] Other data received')
+        match t:
+            case ndi.FRAME_TYPE_VIDEO:
+                log.debug(f'[NDI] Video data received ({v.xres},{v.yres})')
+                frame = np.copy(v.data)
+                ndi.recv_free_video_v2(self.ndi_recv, v)
+                return frame
+            case ndi.FRAME_TYPE_AUDIO:
+                ndi.recv_free_audio_v2(self.ndi_recv, a)
+            case ndi.FRAME_TYPE_METADATA | ndi.FRANE_TYPE_STATUS_CHANGE:
+                if m.length:
+                    metadata = m.data
+                else:
+                    metadata = None
+                log.debug(f'[NDI] Metadata received: {metadata} ')
+                ndi.recv_free_metadata(self.ndi_recv, m)
+            case ndi.FRAME_TYPE_NONE:
+                log.debug('[NDI] No new data received')
+            case _:
+                log.debug('[NDI] Other data received')
 
     def queue_frames(self, queue: Queue):
         while True:
@@ -149,23 +165,32 @@ class NDI:
 def background_frame_to_osc(config: Config, frame_queue: Queue[np.ndarray]):
     osc = OSC.from_config(config)
 
-    x_old = -1
-    y_old = -1
     mask = np.zeros(0, dtype=bool)
+    segement_last_frames: dict[str,deque[np.ndarray]] = defaultdict(deque)
     while True:
         frame = frame_queue.get()
 
-        per = 0.20
         # Yes. y than x
         y, x, _ = frame.shape
-        if (x_old, y_old) != (x, y):
-            y_b = math.floor(y * per)
-            x_b = math.floor(x * per)
-            mask = np.ones((y, x), dtype=bool)
-            mask[y_b:y - y_b + 1, x_b:x - x_b + 1] = False
+        for segment in config.segments:
+            log.debug(f"Gen Mask for {segment.name}")
+            mask = segment.gen_mask((x,y)).transpose()
+            last_frames = segement_last_frames[segment.name]
 
-        avg_rgb = np.average(frame[mask], axis=0).round()
-        osc.send_rgb(avg_rgb[0], avg_rgb[1], avg_rgb[2])
+            match segment.mode:
+                case "average":
+                    rgb = np.average(frame[mask], axis=0).round()
+                case "average-invert":
+                    rgb = 255 - np.average(frame[mask], axis=0).round()
+
+            if segment.average_frames:
+                if len(segement_last_frames) == segment.average_frames:
+                    last_frames.popleft()
+                last_frames.append(rgb)
+
+                rgb = np.average(last_frames, axis=0)
+
+            osc.send_rgb(rgb[0], rgb[1], rgb[2], segment=segment.name)
 
 
 @click.command()
@@ -181,9 +206,14 @@ def background_frame_to_osc(config: Config, frame_queue: Queue[np.ndarray]):
     is_flag=True,
     help="Send all OSC paths, usefull with qlcplus profile wizard.",
 )
+@click.option(
+    "--display",
+    is_flag=True,
+)
 def main(
     config_path: Path,
     send_paths: bool,
+    display: bool,
 ):
     basic_format: str = "[%(levelname)s] %(message)s"
     logging.basicConfig(level=logging.DEBUG,
@@ -202,6 +232,25 @@ def main(
 
     # Init ndi
     ndi_provider = NDI()
+
+    if display:
+        frame = None
+        while frame is None:
+            frame = ndi_provider.recv_frame()
+
+        dim = list(frame.shape)
+        dim[2] = 4
+        frame = np.resize(frame,dim)
+        log.info(str(frame.shape))
+        frame[:,:,3] = 100
+
+        for segment in config.segments:
+            mask = segment.gen_mask((dim[1],dim[0])).transpose()
+            frame[mask,3] = 255
+
+        plt.imshow(frame, interpolation=None)
+        plt.show()
+        return
 
     frame_queue = Queue(8)
 

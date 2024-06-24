@@ -23,9 +23,11 @@ dependencies = [
   "rich",
   "questionary",
   "ruamel.yaml",
+  "pydantic",
+  "matplotlib",
 ]
 dynamic = ["version"]
 
 
 [tool.hatch.version]
-path = "ndi-to-osc/__about__.py"
+path = "ndi_to_osc/__about__.py"
