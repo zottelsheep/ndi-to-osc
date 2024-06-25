@@ -5,7 +5,7 @@ from multiprocessing import Queue
 import multiprocessing as mp
 from pathlib import Path
 import sys
-from time import sleep
+from time import perf_counter, sleep
 import typing as t
 
 import click
@@ -40,6 +40,8 @@ class Config(BaseModel):
 
     blackout_threshold: int = 0
 
+    max_change_rate_per_frame: float = 10
+
     segments: list[Segment]
 
 
@@ -59,22 +61,26 @@ class OSC:
 
     def send(self, addr: str, value: float | int = 1):
         """Send message to OSC bus"""
-        if value > self.blackout_threshold:
-            self.client.send_message(addr, value)  # Send float message
+        self.client.send_message(addr, value)  # Send float message
 
     def send_paths(self):
         for path in "RGB":
             self.send(path, 1)
             sleep(0.05)
 
-    def send_rgb(self, r: float, g: float, b: float,
-                 segment: str):
-        if segment:
-            log.debug(f"[OSC] Send RGB values for segment '{segment}': R={r:.2f}, G={g:.2f}, B={b:.2f}")
+    def send_rgb(self, rgb: np.ndarray, segment: str):
+        log.debug(f"{rgb}, {rgb.dtype}, {rgb.shape}")
 
-        self.send(f"segment_{segment}_R", int(r))
-        self.send(f"segment_{segment}_G", int(g))
-        self.send(f"segment_{segment}_B", int(b))
+        if sum(rgb <= self.blackout_threshold) >= 2:
+            rgb = np.array((0,0,0))
+            log.debug(f"[OSC] Send RGB values for segment '{segment}': R={rgb[0]}, G={rgb[1]}, B={rgb[2]} [Blackout Override]")
+        else:
+            log.debug(f"[OSC] Send RGB values for segment '{segment}': R={rgb[0]}, G={rgb[1]}, B={rgb[2]}")
+
+
+        self.send(f"segment_{segment}_R", int(rgb[0]))
+        self.send(f"segment_{segment}_G", int(rgb[1]))
+        self.send(f"segment_{segment}_B", int(rgb[2]))
 
 
 class NDI:
@@ -165,32 +171,55 @@ class NDI:
 def background_frame_to_osc(config: Config, frame_queue: Queue[np.ndarray]):
     osc = OSC.from_config(config)
 
-    mask = np.zeros(0, dtype=bool)
-    segement_last_frames: dict[str,deque[np.ndarray]] = defaultdict(deque)
+    segement_last_rgb: dict[str,np.ndarray] = {}
+
+    max_change_rate_per_frame = (config.max_change_rate_per_frame
+                                 * 0.01 * np.array((255,255,255,255)))
+
+    last_frame = None
+
     while True:
+        t1 = perf_counter()
+
         frame = frame_queue.get()
+        if frame is None:
+            if last_frame is not None:
+                frame = last_frame
+            else:
+                continue
 
-        # Yes. y than x
-        y, x, _ = frame.shape
+        t2_framequeue = perf_counter()
+
+        t_segment_1 = perf_counter()
         for segment in config.segments:
-            log.debug(f"Gen Mask for {segment.name}")
-            mask = segment.gen_mask((x,y)).transpose()
-            last_frames = segement_last_frames[segment.name]
 
-            match segment.mode:
-                case "average":
-                    rgb = np.average(frame[mask], axis=0).round()
-                case "average-invert":
-                    rgb = 255 - np.average(frame[mask], axis=0).round()
+            rgb = segment.frame_to_rgb(frame)
 
-            if segment.average_frames:
-                if len(segement_last_frames) == segment.average_frames:
-                    last_frames.popleft()
-                last_frames.append(rgb)
+            if segment.name in segement_last_rgb:
+                last_rgb = segement_last_rgb[segment.name]
+                current_change = rgb - last_rgb
+                log.debug(f"[COMPUTE] {current_change=},{last_rgb=},{rgb=},{max_change_rate_per_frame=}")
+                if (np.abs(current_change) >= max_change_rate_per_frame).any():
+                    limited_rgb = last_rgb + (max_change_rate_per_frame * np.sign(current_change))
+                    limited_rgb = np.minimum(np.maximum(limited_rgb,0),255)
+                    log.debug(f"[COMPUTE] Color-Jump: Limiting change from {rgb} to {limited_rgb}")
 
-                rgb = np.average(last_frames, axis=0)
+                    rgb = limited_rgb
 
-            osc.send_rgb(rgb[0], rgb[1], rgb[2], segment=segment.name)
+            segement_last_rgb[segment.name] = rgb
+
+            osc.send_rgb(rgb, segment=segment.name)
+
+        t_segment_2 = perf_counter()
+
+        last_frame = frame
+
+        t2 = perf_counter()
+
+        log.debug(f"[COMPUTE] Timing {t2-t1:.2f}s\n"
+                  f"          Frame-Queue {t2_framequeue-t1:.2f}s\n"
+                  f"          Segments {t_segment_2-t_segment_1:.2f}s")
+
 
 
 @click.command()
@@ -261,10 +290,8 @@ def main(
     frame_process.start()
 
     while True:
-        frame = ndi_provider.recv_frame()
-        if frame is None:
-            continue
         log.debug(f"QUEUE-SIZE: {frame_queue.qsize()}")
+        frame = ndi_provider.recv_frame()
         frame_queue.put(frame)
 
 

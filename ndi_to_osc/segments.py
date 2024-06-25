@@ -1,11 +1,9 @@
 from __future__ import annotations
 from abc import abstractmethod
-from logging import log
 import logging
 from math import ceil
 from typing import Annotated, Literal
 from pydantic import BaseModel, Field, model_validator
-from ndi_to_osc.utils import cache_method
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -13,19 +11,41 @@ log = logging.getLogger(__name__)
 class Segment(BaseModel):
     name: str
     mask: list[Annotated[Circle | Block, Field(discriminator="type")]]
-    average_frames: int = 0
     delay: int = 0
     mode: Literal["average","average-invert"] = "average"
 
-    # @cache_method
+    def model_post_init(self, __context) -> None:
+        self._mask_cache = {}
+        return super().model_post_init(__context)
+
     def gen_mask(self, dimensions: tuple[int,int]):
+        if dimensions in self._mask_cache:
+            return self._mask_cache[dimensions]
+
+        log.debug(f"[SEGMENT] Gen Mask for {self.name}")
         mask = np.zeros(dimensions, dtype=bool)
 
         for sub_mask_config in self.mask:
             sub_mask = sub_mask_config.gen_mask(dimensions)
             mask = mask | sub_mask
 
+        self._mask_cache[dimensions] = mask
+
         return mask
+
+    def frame_to_rgb(self, frame:np.ndarray) -> np.ndarray:
+
+        # Yes. y than x
+        y, x, _ = frame.shape
+        mask = self.gen_mask((x,y)).transpose()
+
+        match self.mode:
+            case "average":
+                rgb = np.average(frame[mask], axis=0).round()
+            case "average-invert":
+                rgb = 255 - np.average(frame[mask], axis=0).round()
+
+        return rgb
 
 
 class Mask(BaseModel):
