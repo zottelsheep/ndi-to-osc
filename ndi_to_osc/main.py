@@ -9,7 +9,6 @@ from time import perf_counter, sleep
 import typing as t
 
 import click
-import math
 from matplotlib import pyplot as plt
 import numpy as np
 from pydantic import BaseModel
@@ -69,11 +68,9 @@ class OSC:
             sleep(0.05)
 
     def send_rgb(self, rgb: np.ndarray, segment: str):
-        log.debug(f"{rgb}, {rgb.dtype}, {rgb.shape}")
-
         if sum(rgb <= self.blackout_threshold) >= 2:
+            log.debug(f"[OSC] Send RGB values for segment '{segment}': R={rgb[0]}|0, G={rgb[1]}|0, B={rgb[2]}|0 [Blackout Override]")
             rgb = np.array((0,0,0))
-            log.debug(f"[OSC] Send RGB values for segment '{segment}': R={rgb[0]}, G={rgb[1]}, B={rgb[2]} [Blackout Override]")
         else:
             log.debug(f"[OSC] Send RGB values for segment '{segment}': R={rgb[0]}, G={rgb[1]}, B={rgb[2]}")
 
@@ -137,8 +134,8 @@ class NDI:
         ndi.destroy()
         log.info('[NDI] Deinitalizing complete!')
 
-    def recv_frame(self, rate: int = 250) -> np.ndarray | None:
-        t, v, a, m = ndi.recv_capture_v2(self.ndi_recv, rate)
+    def recv_frame(self, rate: int = 100) -> np.ndarray | None:
+        t, v, a, m = ndi.recv_capture_v3(self.ndi_recv, rate)
 
         match t:
             case ndi.FRAME_TYPE_VIDEO:
@@ -147,7 +144,7 @@ class NDI:
                 ndi.recv_free_video_v2(self.ndi_recv, v)
                 return frame
             case ndi.FRAME_TYPE_AUDIO:
-                ndi.recv_free_audio_v2(self.ndi_recv, a)
+                ndi.recv_free_audio_v3(self.ndi_recv, a)
             case ndi.FRAME_TYPE_METADATA | ndi.FRANE_TYPE_STATUS_CHANGE:
                 if m.length:
                     metadata = m.data
@@ -167,59 +164,67 @@ class NDI:
                 continue
             queue.put(frame)
 
+BASE_CHANGE_RATE = np.array((0.1,0.1,0.1,0.1)) * 1
+def smoothed(last_rgbs: np.ndarray):
+    max_var = 65000 #
+    changes = last_rgbs[1:] - last_rgbs[:-1]
+    var = np.var(changes,axis=0)
+    factor = 100 - (var / max_var)
+    last_rgb = last_rgbs[-1]
+    log.debug(f"[COMPUTE] {last_rgb=}, {var=}, {factor=}")
 
-def background_frame_to_osc(config: Config, frame_queue: Queue[np.ndarray]):
+    if (factor > 99.95).all():
+        log.debug(f"[COMPUTE] Skipping smoothing")
+        return last_rgb
+
+    # last_rgb_sign = np.sign(last_rgb)
+    # change_rate = changes[-1] * factor
+    change_rate = BASE_CHANGE_RATE * factor * np.sign(changes[-1])
+    log.debug(f"[COMPUTE] Smooth with change rate {change_rate}")
+    return np.minimum(np.maximum(last_rgbs[-2] + change_rate,0),255)
+
+
+def background_frame_to_osc(config: Config,
+                            frame_queue: Queue[np.ndarray],
+                            frame_rate: int = 20):
+
     osc = OSC.from_config(config)
 
-    segement_last_rgb: dict[str,np.ndarray] = {}
+    segment_last_rgbs: dict[str,deque[np.ndarray]] \
+            = defaultdict(lambda: deque([np.array((0.,0.,0.,0.))]*2))
 
-    max_change_rate_per_frame = (config.max_change_rate_per_frame
-                                 * 0.01 * np.array((255,255,255,255)))
-
-    last_frame = None
-
+    frame_time_correction = 0
     while True:
-        t1 = perf_counter()
+        start_frame_time = perf_counter()
 
-        frame = frame_queue.get()
-        if frame is None:
-            if last_frame is not None:
-                frame = last_frame
-            else:
-                continue
+        if frame_queue.empty():
+            frame = None
+        else:
+            frame = frame_queue.get_nowait()
 
-        t2_framequeue = perf_counter()
-
-        t_segment_1 = perf_counter()
         for segment in config.segments:
+            last_rgbs = segment_last_rgbs[segment.name]
 
-            rgb = segment.frame_to_rgb(frame)
+            if frame is not None:
+                rgb = segment.frame_to_rgb(frame)
+                last_rgbs.append(rgb)
+            else:
+                rgb = last_rgbs[-1]
 
-            if segment.name in segement_last_rgb:
-                last_rgb = segement_last_rgb[segment.name]
-                current_change = rgb - last_rgb
-                log.debug(f"[COMPUTE] {current_change=},{last_rgb=},{rgb=},{max_change_rate_per_frame=}")
-                if (np.abs(current_change) >= max_change_rate_per_frame).any():
-                    limited_rgb = last_rgb + (max_change_rate_per_frame * np.sign(current_change))
-                    limited_rgb = np.minimum(np.maximum(limited_rgb,0),255)
-                    log.debug(f"[COMPUTE] Color-Jump: Limiting change from {rgb} to {limited_rgb}")
+            if len(last_rgbs) > 20:
+                last_rgbs.popleft()
 
-                    rgb = limited_rgb
+            rgb = smoothed(np.array(last_rgbs))
+            last_rgbs[-1] = rgb
 
-            segement_last_rgb[segment.name] = rgb
 
             osc.send_rgb(rgb, segment=segment.name)
 
-        t_segment_2 = perf_counter()
+        stop_frame_time = perf_counter()
 
-        last_frame = frame
+        frame_time_correction = stop_frame_time - start_frame_time
 
-        t2 = perf_counter()
-
-        log.debug(f"[COMPUTE] Timing {t2-t1:.2f}s\n"
-                  f"          Frame-Queue {t2_framequeue-t1:.2f}s\n"
-                  f"          Segments {t_segment_2-t_segment_1:.2f}s")
-
+        sleep(max((1/frame_rate)-frame_time_correction,0))
 
 
 @click.command()
