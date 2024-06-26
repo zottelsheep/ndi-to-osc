@@ -2,6 +2,8 @@ from itertools import islice
 import typing as t
 import weakref
 import functools
+import numpy as np
+import colorsys
 
 T = t.TypeVar('T')
 def batched(iterable:t.Iterable[T], n:int) -> t.Iterator[t.Sequence[T]]:
@@ -38,3 +40,17 @@ P = t.ParamSpec('P')
 T = t.TypeVar('T')
 def cache_method(func: t.Callable[P,T]) -> t.Callable[P,T]:
     return lru_method_cache(maxsize=None)(func)
+hsl_to_rgb_vec = np.vectorize(lambda rgb: np.array(colorsys.hls_to_rgb(*rgb)),
+                              signature='(3)->(3)')
+
+def fade_rgb(from_rgb: tuple[int,int,int],
+             to_rgb: tuple[int,int,int],
+             steps: int):
+    from_hsl = colorsys.rgb_to_hls(*(np.array(from_rgb)))
+    to_hsl = colorsys.rgb_to_hls(*(np.array(to_rgb)))
+
+    fades = np.linspace(from_hsl,to_hsl,steps)
+    fades_rgb = hsl_to_rgb_vec(fades).round().astype(int)
+    return fades_rgb
+
+
