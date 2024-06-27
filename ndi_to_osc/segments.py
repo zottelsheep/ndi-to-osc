@@ -8,11 +8,16 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+AVAILABLE_MODES = Literal["average","average-invert"]
+
 class Segment(BaseModel):
     name: str
     mask: list[Annotated[Circle | Block, Field(discriminator="type")]]
-    delay: int = 0
-    mode: Literal["average","average-invert"] = "average"
+    # delay: int = 0
+    smooth: bool = True
+
+    mode: AVAILABLE_MODES = "average"
+    alt_mode: AVAILABLE_MODES | None = None
 
     def model_post_init(self, __context) -> None:
         self._mask_cache = {}
@@ -33,19 +38,31 @@ class Segment(BaseModel):
 
         return mask
 
-    def frame_to_rgb(self, frame:np.ndarray) -> np.ndarray:
+    def frame_to_rgb(self, frame:np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
 
         # Yes. y than x
         y, x, _ = frame.shape
         mask = self.gen_mask((x,y)).transpose()
 
-        match self.mode:
+        rgb = self._rgb_from_masked_frame(frame[mask],self.mode)
+
+        rgb_alt = None
+        if self.alt_mode:
+            rgb_alt = self._rgb_from_masked_frame(frame[mask],self.alt_mode)
+
+        return rgb, rgb_alt
+
+    @staticmethod
+    def _rgb_from_masked_frame(frame: np.ndarray,
+                               mode: Literal["average", "average-invert"]) -> np.ndarray:
+        match mode:
             case "average":
-                rgb = np.average(frame[mask], axis=0).round()
+                rgb = np.average(frame, axis=0).round()
             case "average-invert":
-                rgb = 255 - np.average(frame[mask], axis=0).round()
+                rgb = 255 - np.average(frame, axis=0).round()
 
         return rgb
+
 
 
 class Mask(BaseModel):

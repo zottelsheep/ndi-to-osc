@@ -191,6 +191,8 @@ def background_frame_to_osc(config: Config,
 
     segment_last_rgbs: dict[str,deque[np.ndarray]] \
             = defaultdict(lambda: deque([np.array((0.,0.,0.,0.))]*2))
+    segment_last_rgbs_alt: dict[str,deque[np.ndarray]] \
+            = defaultdict(lambda: deque([np.array((0.,0.,0.,0.))]*2))
 
     while True:
         start_frame_time = perf_counter()
@@ -199,22 +201,32 @@ def background_frame_to_osc(config: Config,
 
         for segment in config.segments:
             last_rgbs = segment_last_rgbs[segment.name]
+            last_rgbs_alt = segment_last_rgbs_alt[segment.name]
 
             if frame is not None:
-                rgb = segment.frame_to_rgb(frame)
+                rgb, rgb_alt = segment.frame_to_rgb(frame)
                 last_rgbs.append(rgb)
+                if rgb_alt is not None and segment.alt_mode:
+                    last_rgbs_alt.append(rgb_alt)
             else:
                 rgb = last_rgbs[-1]
+                if segment.alt_mode:
+                    rgb_alt = last_rgbs_alt[-1]
 
             if len(last_rgbs) > 20:
                 last_rgbs.popleft()
 
-            rgb = smoothed(np.array(last_rgbs))
-            last_rgbs[-1] = rgb
-
+            if segment.smooth:
+                rgb = smoothed(np.array(last_rgbs))
+                last_rgbs[-1] = rgb
+                if segment.alt_mode:
+                    rgb_alt = smoothed(np.array(last_rgbs_alt))
+                    last_rgbs_alt[-1] = rgb_alt
 
             osc.send_rgb(rgb, segment=segment.name)
 
+            if segment.alt_mode:
+                osc.send_rgb(rgb, segment=f"{segment.name}_alt")
 
         stop_frame_time = perf_counter()
         log.debug(f"[COMPUTE] Frame took {stop_frame_time-start_frame_time:.3f}")
