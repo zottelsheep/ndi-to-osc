@@ -164,43 +164,38 @@ class NDI:
                 continue
             queue.put(frame)
 
-BASE_CHANGE_RATE = np.array((0.1,0.1,0.1,0.1)) * 1
+BASE_CHANGE_RATE = np.array((0.1,0.1,0.1,0)) * 1
 def smoothed(last_rgbs: np.ndarray):
     max_var = 65000 #
     changes = last_rgbs[1:] - last_rgbs[:-1]
-    var = np.var(changes,axis=0)
+    var = np.var(changes**2,axis=0)
     factor = 100 - (var / max_var)
     last_rgb = last_rgbs[-1]
     log.debug(f"[COMPUTE] {last_rgb=}, {var=}, {factor=}")
 
-    if (factor > 99.95).all():
+    if (factor[:3] > 90).all():
         log.debug(f"[COMPUTE] Skipping smoothing")
         return last_rgb
 
-    # last_rgb_sign = np.sign(last_rgb)
-    # change_rate = changes[-1] * factor
-    change_rate = BASE_CHANGE_RATE * factor * np.sign(changes[-1])
-    log.debug(f"[COMPUTE] Smooth with change rate {change_rate}")
-    return np.minimum(np.maximum(last_rgbs[-2] + change_rate,0),255)
+    change = np.round(BASE_CHANGE_RATE * factor * np.sign(changes[-1]))
+    limited = np.minimum(np.maximum(last_rgbs[-2] + change,0),255)
+    log.debug(f"[COMPUTE] Smooth {last_rgb} from {last_rgb[-2]} to {limited} with change {change}")
+
+    return limited
 
 
 def background_frame_to_osc(config: Config,
-                            frame_queue: Queue[np.ndarray],
-                            frame_rate: int = 20):
+                            frame_queue: Queue[np.ndarray]):
 
     osc = OSC.from_config(config)
 
     segment_last_rgbs: dict[str,deque[np.ndarray]] \
             = defaultdict(lambda: deque([np.array((0.,0.,0.,0.))]*2))
 
-    frame_time_correction = 0
     while True:
         start_frame_time = perf_counter()
 
-        if frame_queue.empty():
-            frame = None
-        else:
-            frame = frame_queue.get_nowait()
+        frame = frame_queue.get()
 
         for segment in config.segments:
             last_rgbs = segment_last_rgbs[segment.name]
@@ -220,11 +215,9 @@ def background_frame_to_osc(config: Config,
 
             osc.send_rgb(rgb, segment=segment.name)
 
+
         stop_frame_time = perf_counter()
-
-        frame_time_correction = stop_frame_time - start_frame_time
-
-        sleep(max((1/frame_rate)-frame_time_correction,0))
+        log.debug(f"[COMPUTE] Frame took {stop_frame_time-start_frame_time:.3f}")
 
 
 @click.command()
@@ -297,7 +290,8 @@ def main(
     while True:
         log.debug(f"QUEUE-SIZE: {frame_queue.qsize()}")
         frame = ndi_provider.recv_frame()
-        frame_queue.put(frame)
+        if frame is not None:
+            frame_queue.put(frame)
 
 
 if __name__ == "__main__":
